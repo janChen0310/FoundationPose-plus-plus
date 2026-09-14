@@ -11,7 +11,7 @@ import imageio.v2 as imageio  # Suppress DeprecationWarning
 import trimesh
 from scipy.spatial.transform import Rotation
 from VOT import Cutie, Tracker_2D  
-from utils.kalman_filter_6d import KalmanFilter6D
+from utils.kalman_filter_6d import LegacyKalmanFilter6D
 
 
 
@@ -353,7 +353,7 @@ def pose_track(
     #################################################
 
     if activate_kalman_filter:
-        kf = KalmanFilter6D(args.kf_measurement_noise_scale)
+        kf = LegacyKalmanFilter6D(args.kf_measurement_noise_scale)
 
     total_frames = len(frame_color_list)
     pose_seq = [None] * total_frames  # Initialize as None

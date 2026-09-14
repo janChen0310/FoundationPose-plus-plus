@@ -13,6 +13,7 @@ import itertools
 from learning.training.predict_score import *
 from learning.training.predict_pose_refine import *
 import yaml
+import tempfile
 
 
 class FoundationPose:
@@ -64,9 +65,17 @@ class FoundationPose:
     self.normals = F.normalize(torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device='cuda'), dim=-1)
     logging.info(f'self.pts:{self.pts.shape}')
     self.mesh_path = None
+    self._mesh_export_tmp = None
     self.mesh = mesh
     if self.mesh is not None:
-      self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
+      # trimesh writes OBJ sidecars (for example ``material_0.png``) beside
+      # the OBJ. Exporting every estimator directly into /tmp therefore makes
+      # unrelated runs collide on the same sidecar and can fail when a prior
+      # run used another UID. Keep one private directory alive for the
+      # estimator lifetime; TemporaryDirectory removes it on normal teardown.
+      self._mesh_export_tmp = tempfile.TemporaryDirectory(
+        prefix='foundationpose-mesh-', dir=self.debug_dir)
+      self.mesh_path = os.path.join(self._mesh_export_tmp.name, 'model.obj')
       self.mesh.export(self.mesh_path)
     self.mesh_tensors = make_mesh_tensors(self.mesh)
 
@@ -286,4 +295,3 @@ class FoundationPose:
       extra['vis'] = vis
     self.pose_last = pose
     return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
-

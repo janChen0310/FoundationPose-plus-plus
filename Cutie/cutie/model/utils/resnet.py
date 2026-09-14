@@ -38,6 +38,20 @@ model_urls = {
 }
 
 
+def load_pretrained_weights(url):
+    """Load legacy torchvision weights without inheriting a CUDA default.
+
+    FoundationPose changes PyTorch's process-wide default tensor type to a
+    CUDA tensor.  PyTorch's legacy tar deserializer creates an intermediate
+    tensor using that default even when ``map_location="cpu"`` is supplied,
+    which makes it try to attach CPU storage to a CUDA tensor.  A device
+    context controls that intermediate allocation without changing the
+    caller's persistent default device.
+    """
+    with torch.device("cpu"):
+        return model_zoo.load_url(url, map_location="cpu")
+
+
 def conv3x3(in_planes, out_planes, stride=1, dilation=1):
     return nn.Conv2d(in_planes,
                      out_planes,
@@ -168,12 +182,16 @@ class ResNet(nn.Module):
 def resnet18(pretrained=True, extra_dim=0):
     model = ResNet(BasicBlock, [2, 2, 2, 2], extra_dim)
     if pretrained:
-        load_weights_add_extra_dim(model, model_zoo.load_url(model_urls['resnet18']), extra_dim)
+        load_weights_add_extra_dim(
+            model, load_pretrained_weights(model_urls['resnet18']), extra_dim
+        )
     return model
 
 
 def resnet50(pretrained=True, extra_dim=0):
     model = ResNet(Bottleneck, [3, 4, 6, 3], extra_dim)
     if pretrained:
-        load_weights_add_extra_dim(model, model_zoo.load_url(model_urls['resnet50']), extra_dim)
+        load_weights_add_extra_dim(
+            model, load_pretrained_weights(model_urls['resnet50']), extra_dim
+        )
     return model

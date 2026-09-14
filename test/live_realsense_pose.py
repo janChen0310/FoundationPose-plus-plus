@@ -29,10 +29,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--depth-width",
+        type=int,
+        help="Depth stream width (defaults to --width). Use 1280 with 1920x1080 color.",
+    )
+    parser.add_argument(
+        "--depth-height",
+        type=int,
+        help="Depth stream height (defaults to --height). Use 720 with 1920x1080 color.",
+    )
+    parser.add_argument(
+        "--serial",
+        type=str,
+        default="254322070766",
+        help="RealSense serial number (default: camera_0 254322070766).",
+    )
     parser.add_argument("--est-refine-iter", type=int, default=10)
     parser.add_argument("--track-refine-iter", type=int, default=3)
     parser.add_argument("--activate-2d-tracker", action="store_true", help="Use Cutie to track the object bbox between frames.")
-    parser.add_argument("--activate-kalman-filter", action="store_true", help="Smooth 6D pose and fuse the 2D tracker measurement.")
+    parser.add_argument(
+        "--activate-kalman-filter",
+        action="store_true",
+        help="Smooth the 6D pose and fuse the optional 2D tracker measurement.",
+    )
     parser.add_argument("--kf-measurement-noise-scale", type=float, default=0.05)
     parser.add_argument(
         "--color",
@@ -156,9 +176,11 @@ def main() -> int:
     if args.activate_kalman_filter:
         try:
             sys.path.insert(0, str(repo_dir / "src"))
-            from utils.kalman_filter_6d import KalmanFilter6D
+            from utils.kalman_filter_6d import LegacyKalmanFilter6D
 
-            kalman_filter = KalmanFilter6D(args.kf_measurement_noise_scale)
+            # Keep the native single-camera behavior equivalent to the JHU
+            # reference. The time-aware filter is reserved for rig fusion.
+            kalman_filter = LegacyKalmanFilter6D(args.kf_measurement_noise_scale)
         except ImportError as exc:
             raise SystemExit(f"The Kalman filter is unavailable: {exc}") from exc
 
@@ -208,8 +230,11 @@ def main() -> int:
 
     pipeline = rs.pipeline()
     config = rs.config()
+    config.enable_device(args.serial)
+    depth_width = args.depth_width if args.depth_width is not None else args.width
+    depth_height = args.depth_height if args.depth_height is not None else args.height
     config.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
-    config.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, args.fps)
     try:
         profile = pipeline.start(config)
     except RuntimeError as exc:
@@ -224,6 +249,21 @@ def main() -> int:
     K = np.array(
         [[intrinsics.fx, 0.0, intrinsics.ppx], [0.0, intrinsics.fy, intrinsics.ppy], [0.0, 0.0, 1.0]],
         dtype=np.float32,
+    )
+    device = profile.get_device()
+    logging.info(
+        "Using RealSense %s (serial=%s, firmware=%s)",
+        device.get_info(rs.camera_info.name),
+        device.get_info(rs.camera_info.serial_number),
+        device.get_info(rs.camera_info.firmware_version),
+    )
+    logging.info(
+        "Streams: color=%dx%d, depth=%dx%d, fps=%d (aligned depth follows color)",
+        args.width,
+        args.height,
+        depth_width,
+        depth_height,
+        args.fps,
     )
     logging.info("D435 depth scale: %g m; K=\n%s", depth_scale, K)
 
@@ -276,28 +316,53 @@ def main() -> int:
                 if initialized and tracker_2d is not None:
                     bbox_2d = tracker_2d.initialize(rgb, init_info={"mask": init_mask})
                 if initialized and kalman_filter is not None:
-                    kf_mean, kf_covariance = kalman_filter.initiate(pose_to_6d(estimator.pose_last))
+                    kf_mean, kf_covariance = kalman_filter.initiate(
+                        pose_to_6d(estimator.pose_last)
+                    )
             elif initialized:
                 if tracker_2d is not None:
                     bbox_2d = tracker_2d.track(rgb)
-                    if bbox_2d[2] > 1 and bbox_2d[3] > 1:
+                    if bbox_2d is not None and bbox_2d[2] > 1 and bbox_2d[3] > 1:
                         x, y, width, height = bbox_2d
                         cx, cy = x + width / 2.0, y + height / 2.0
                         if kalman_filter is None:
-                            estimator.pose_last = adjust_pose_to_image_point(estimator.pose_last, K, cx, cy)
+                            estimator.pose_last = adjust_pose_to_image_point(
+                                estimator.pose_last, K, cx, cy
+                            )
                         else:
-                            kf_mean, kf_covariance = kalman_filter.update(kf_mean, kf_covariance, pose_to_6d(estimator.pose_last))
-                            pose_last_single = estimator.pose_last[0] if estimator.pose_last.ndim == 3 else estimator.pose_last
-                            tz = pose_last_single[2, 3].item()
-                            measurement_xy = np.array([
-                                (cx - K[0, 2]) * tz / K[0, 0],
-                                (cy - K[1, 2]) * tz / K[1, 1],
-                            ], dtype=np.float32)
-                            kf_mean, kf_covariance = kalman_filter.update_from_xy(kf_mean, kf_covariance, measurement_xy)
-                            estimator.pose_last = torch.as_tensor(sixd_to_pose(kf_mean[:6]), device="cuda").unsqueeze(0)
-                pose = estimator.track_one(rgb=rgb, depth=depth, K=K, iteration=args.track_refine_iter)
+                            pose_last_single = (
+                                estimator.pose_last[0]
+                                if estimator.pose_last.ndim == 3
+                                else estimator.pose_last
+                            )
+                            tz = float(pose_last_single[2, 3].detach().cpu())
+                            if tz > 1e-5:
+                                kf_mean, kf_covariance = kalman_filter.update(
+                                    kf_mean, kf_covariance,
+                                    pose_to_6d(estimator.pose_last)
+                                )
+                                measurement_xy = np.array(
+                                    [
+                                        (cx - K[0, 2]) * tz / K[0, 0],
+                                        (cy - K[1, 2]) * tz / K[1, 1],
+                                    ],
+                                    dtype=np.float32,
+                                )
+                                kf_mean, kf_covariance = (
+                                    kalman_filter.update_from_xy(
+                                        kf_mean, kf_covariance, measurement_xy
+                                    )
+                                )
+                                estimator.pose_last = torch.as_tensor(
+                                    sixd_to_pose(kf_mean[:6]), device="cuda"
+                                ).unsqueeze(0)
+                pose = estimator.track_one(
+                    rgb=rgb, depth=depth, K=K, iteration=args.track_refine_iter
+                )
                 if kalman_filter is not None:
-                    kf_mean, kf_covariance = kalman_filter.predict(kf_mean, kf_covariance)
+                    kf_mean, kf_covariance = kalman_filter.predict(
+                        kf_mean, kf_covariance
+                    )
 
             if pose is None:
                 continue

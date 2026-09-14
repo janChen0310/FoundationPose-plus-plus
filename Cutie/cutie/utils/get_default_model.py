@@ -12,8 +12,12 @@ from cutie.utils.download_models import download_models_if_needed
 
 
 def get_default_model() -> CUTIE:
-    initialize(version_base='1.3.2', config_path="../config", job_name="eval_config")
-    cfg = compose(config_name="eval_config")
+    # ``get_default_model`` is called once per camera.  Use Hydra's context
+    # manager so its process-global state is released after each composition;
+    # otherwise constructing the second stereo tracker fails with "GlobalHydra
+    # is already initialized".
+    with initialize(version_base='1.3.2', config_path="../config", job_name="eval_config"):
+        cfg = compose(config_name="eval_config")
 
     weight_dir = download_models_if_needed()
     with open_dict(cfg):
@@ -22,7 +26,11 @@ def get_default_model() -> CUTIE:
 
     # Load the network weights
     cutie = CUTIE(cfg).cuda().eval()
-    model_weights = torch.load(cfg.weights)
+    # Keep checkpoint deserialization on CPU. ``CUTIE`` has already been moved
+    # to CUDA above, and ``load_weights``/``load_state_dict`` safely copy the
+    # CPU tensors into that model. This avoids legacy CUDA-storage failures in
+    # recent PyTorch releases.
+    model_weights = torch.load(cfg.weights, map_location="cpu")
     cutie.load_weights(model_weights)
 
     return cutie
