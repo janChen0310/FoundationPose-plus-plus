@@ -535,7 +535,7 @@ def system_monotonic_offset() -> tuple[int, int]:
     return wall - (before + after) // 2, after - before
 
 
-def frame_timestamp(rs, frame) -> tuple[int, int, int] | None:
+def frame_timestamp(rs, frame, fps: float = 30.0) -> tuple[int, int, int] | None:
     domain = frame.get_frame_timestamp_domain()
     if domain not in (rs.timestamp_domain.global_time, rs.timestamp_domain.system_time):
         return None
@@ -544,7 +544,15 @@ def frame_timestamp(rs, frame) -> tuple[int, int, int] | None:
         sensor_us = float(frame.get_frame_metadata(rs.frame_metadata_value.sensor_timestamp))
     except RuntimeError:
         return None
-    stamp_ms = float(frame.get_timestamp()) + (sensor_us - frame_us) / 1000.0
+    # Match the native capture contract: the sensor/readout metadata delta
+    # must fit inside one exposure period. A wrap or corrupt metadata pair
+    # must not turn an old pose into an authoritative acquisition timestamp.
+    metadata_delta_ms = (sensor_us - frame_us) / 1000.0
+    if (not np.isfinite(fps) or fps <= 0.0 or
+            not np.isfinite(metadata_delta_ms) or
+            abs(metadata_delta_ms) >= 1000.0 / fps):
+        return None
+    stamp_ms = float(frame.get_timestamp()) + metadata_delta_ms
     if not np.isfinite(stamp_ms) or stamp_ms <= 0:
         return None
     ros_ns = int(round(stamp_ms * 1e6))
@@ -1566,6 +1574,9 @@ def main() -> int:
             frames0 = align0.process(raw0)
             color0, depth0 = frames0.get_color_frame(), frames0.get_depth_frame()
             if not color0 or not depth0:
+                publisher.lost(locked.name, "camera0_incomplete_rgbd")
+                publisher.lost(cube.name, "camera0_incomplete_rgbd")
+                previous_cube_world = previous_cube_ns = None
                 publisher.heartbeat()
                 continue
             bgr0 = np.asanyarray(color0.get_data())
@@ -1592,9 +1603,14 @@ def main() -> int:
             K0_inference = K0.copy()
             K0_inference[0, :] *= inference_size[0] / bgr0.shape[1]
             K0_inference[1, :] *= inference_size[1] / bgr0.shape[0]
-            timestamp = frame_timestamp(rs, color0)
+            timestamp = frame_timestamp(rs, color0, capture_fps)
             frame_number = int(color0.get_frame_number())
             frame_index += 1
+            # mesh_pose/cube_pose_camera0 are retained as tracking priors through
+            # short failures. Only an accepted result from THIS exposure may
+            # be published with its timestamp. The recovery threshold controls
+            # reseeding, never how long stale poses masquerade as MEASURED.
+            cube_pose_fresh = False
 
             should_detect = mesh_pose is None or frame_index % args.tag_check_period == 0
             if should_detect:
@@ -1655,6 +1671,8 @@ def main() -> int:
                         )
                         invalid_frames = disagreement_frames = 0
                         last_reason = "fast_reseed_from_cube_tags"
+                        cube_pose_fresh = True
+                        previous_cube_world = previous_cube_ns = None
                         LOGGER.warning(
                             "FoundationPose/Cutie/Kalman fast-reseeded from tags %s "
                             "(p95=%.2f px, no global pose search)",
@@ -1731,6 +1749,8 @@ def main() -> int:
                         )
                         invalid_frames = disagreement_frames = 0
                         last_reason = "registered_from_cube_tags"
+                        cube_pose_fresh = True
+                        previous_cube_world = previous_cube_ns = None
                         LOGGER.warning(
                             "FoundationPose registered from tags %s (p95=%.2f px) "
                             "in %.2f s",
@@ -1763,6 +1783,7 @@ def main() -> int:
                     mesh_pose, cube_pose_camera0 = candidate, candidate_cube
                     invalid_frames = 0
                     last_reason = "foundationpose_camera0"
+                    cube_pose_fresh = True
                 except Exception as exc:  # hardware/CUDA dependent
                     invalid_frames += 1
                     last_reason = f"tracking_invalid:{exc}"
@@ -1771,7 +1792,8 @@ def main() -> int:
                     if invalid_frames >= args.max_invalid_frames:
                         mesh_pose = cube_pose_camera0 = None
 
-            cube_world = None if cube_pose_camera0 is None else rig.t_rig_camera0 @ cube_pose_camera0
+            cube_world = (rig.t_rig_camera0 @ cube_pose_camera0
+                          if cube_pose_fresh else None)
             cube_camera1 = None if cube_world is None else np.linalg.inv(rig.t_rig_camera1) @ cube_world
             mesh_world = None if mesh_pose is None else rig.t_rig_camera0 @ mesh_pose
             mesh_camera1 = None if mesh_world is None else np.linalg.inv(rig.t_rig_camera1) @ mesh_world
@@ -1786,14 +1808,17 @@ def main() -> int:
                     publisher.measured(
                         cube.name, cube_world, cube_covariance, twist, timestamp,
                         frame_number, visible_ids if should_detect else [],
-                        "foundationpose_camera0",
+                        last_reason,
                     )
                     previous_cube_world = cube_world.copy()
                     previous_cube_ns = timestamp[1]
                 else:
                     publisher.lost(cube.name, last_reason)
+                    previous_cube_world = previous_cube_ns = None
             else:
+                publisher.lost(locked.name, "camera0_timestamp_not_authoritative")
                 publisher.lost(cube.name, "camera0_timestamp_not_authoritative")
+                previous_cube_world = previous_cube_ns = None
             publisher.heartbeat()
 
             if not args.no_display:
@@ -1868,6 +1893,8 @@ def main() -> int:
                     invalid_frames = disagreement_frames = 0
                     tag_roi_full = None
                     last_reason = "manual_reinitialization"
+                    previous_cube_world = previous_cube_ns = None
+                    publisher.lost(cube.name, last_reason)
                 if key in (ord("v"), ord("V"), ord("0")):
                     scene_view.reset()
     finally:
