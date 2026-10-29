@@ -1,6 +1,0 @@
-__pycache__/
-*.py[cod]
-live_pose.npy
-live_pose.npy.K.txt
-*.npz
-*.jsonl
